@@ -1,0 +1,75 @@
+name: Build
+
+# Builds and tests RHI on every push to main and every pull request, then
+# packages it. Each run's page has two downloads under "Artifacts":
+#   RHI-Setup-<version>-<commit>     the installer (RHI-Setup.exe)
+#   RHI-<version>-<commit>-portable  the app folder, ready to run without installing
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 8.0.x
+
+      # RenoDXCommander.csproj copies ClrMD from the NuGet cache as a loose file
+      # (it is deliberately not a PackageReference), so make sure it is there.
+      - name: Restore ClrMD into the NuGet cache
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'clrmd'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Set-Content (Join-Path $dir 'clrmd.csproj') '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup><ItemGroup><PackageReference Include="Microsoft.Diagnostics.Runtime" Version="3.1.512801" /></ItemGroup></Project>'
+          dotnet restore (Join-Path $dir 'clrmd.csproj') --packages (Join-Path $env:USERPROFILE '.nuget\packages')
+
+      - name: Build RHI
+        run: dotnet build RenoDXCommander/RenoDXCommander.csproj -c Release -p:Platform=x64
+
+      - name: Build drop helper
+        run: dotnet build RHI.DropHelper/RHI.DropHelper.csproj -c Release
+
+      - name: Run tests
+        run: dotnet test RenoDXCommander.Tests/RenoDXCommander.Tests.csproj -c Release -p:Platform=x64
+
+      - name: Package app and installer
+        id: package
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path RenoDXCommander/RenoDXCommander.csproj -Pattern '<AssemblyVersion>([^<]+)</AssemblyVersion>').Matches[0].Groups[1].Value
+          $sha = '${{ github.event.pull_request.head.sha || github.sha }}'.Substring(0, 7)
+          $publish = Join-Path $env:RUNNER_TEMP 'RHI'
+          $installer = Join-Path $env:RUNNER_TEMP 'installer'
+          ./.github/scripts/package.ps1 -PublishDir $publish -InstallerDir $installer
+          "name=$version-$sha"                              >> $env:GITHUB_OUTPUT
+          "publish=$publish"                                >> $env:GITHUB_OUTPUT
+          "installer=$(Join-Path $installer 'RHI-Setup.exe')" >> $env:GITHUB_OUTPUT
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v6
+        with:
+          name: RHI-Setup-${{ steps.package.outputs.name }}
+          path: ${{ steps.package.outputs.installer }}
+          if-no-files-found: error
+
+      - name: Upload portable app
+        uses: actions/upload-artifact@v6
+        with:
+          name: RHI-${{ steps.package.outputs.name }}-portable
+          path: ${{ steps.package.outputs.publish }}
+          if-no-files-found: error
