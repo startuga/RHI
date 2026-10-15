@@ -12,6 +12,8 @@
 using System.Diagnostics;
 using System.Management;
 using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text.Json;
 using Microsoft.Win32;
 
@@ -307,10 +309,18 @@ public class DldsrService : IDldsrService
 
     // ── Apply State ───────────────────────────────────────────────────────────
 
-    // ProgramData folder for SYSTEM-accessible files
-    private static readonly string ProgramDataDir = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
-        "RHI");
+    // The SYSTEM task reads its script and state from a fresh per-run folder directly under
+    // ProgramData (SYSTEM can't read user folders). See CreatePrivateWorkDir for why it isn't
+    // a shared folder such as C:\ProgramData\RHI.
+    private const string WorkDirPrefix = "RHI-DLDSR-";
+    private const string ScriptFileName = "dldsr-apply.ps1";
+    private const string StateFileName = "dldsr-state.json";
+    private const string LogFileName = "dldsr-apply.log";
+
+    // Copy of the last state handed to the SYSTEM task, kept next to the captures so
+    // SetSmoothnessAsync can rebuild from it after the per-run folder is deleted.
+    private string LastStateFilePath => Path.Combine(
+        Path.GetDirectoryName(CapturesFilePath)!, "dldsr-last-state.json");
 
     public async Task<bool> ApplyStateAsync(string label, IProgress<string>? progress = null, int? smoothnessOverride = null)
     {
@@ -333,10 +343,8 @@ public class DldsrService : IDldsrService
             // Continue anyway — the user can recapture if needed
         }
 
-        // Write capture to ProgramData for SYSTEM-accessible path (user temp is inaccessible to SYSTEM)
         progress?.Report("Preparing DLDSR configuration...");
-        Directory.CreateDirectory(ProgramDataDir);
-        var stateFile = Path.Combine(ProgramDataDir, "dldsr-state.json");
+        string stateJson;
         try
         {
             // If a smoothness override is provided, bake it into the capture blobs before writing
@@ -371,19 +379,17 @@ public class DldsrService : IDldsrService
                 CrashReporter.Log($"[DldsrService.ApplyStateAsync] Baked smoothness {smoothnessOverride}% into capture");
             }
 
-            var stateJson = JsonSerializer.Serialize(captureToApply, _jsonOptions);
-            await File.WriteAllTextAsync(stateFile, stateJson);
-            CrashReporter.Log($"[DldsrService.ApplyStateAsync] Wrote state file to {stateFile}");
+            stateJson = JsonSerializer.Serialize(captureToApply, _jsonOptions);
         }
         catch (Exception ex)
         {
-            CrashReporter.Log($"[DldsrService.ApplyStateAsync] Failed to write state file: {ex.Message}");
+            CrashReporter.Log($"[DldsrService.ApplyStateAsync] Failed to build state: {ex.Message}");
             return false;
         }
 
         // Execute registry writes via scheduled task (SYSTEM privilege)
         progress?.Report("Writing DLDSR configuration...");
-        if (!await ExecuteAsSystemAsync(stateFile))
+        if (!await ExecuteAsSystemAsync(stateJson))
         {
             CrashReporter.Log("[DldsrService.ApplyStateAsync] Failed to execute registry writes");
             return false;
@@ -405,26 +411,33 @@ public class DldsrService : IDldsrService
         return true;
     }
 
-    private async Task<bool> ExecuteAsSystemAsync(string stateFile)
+    private async Task<bool> ExecuteAsSystemAsync(string stateJson)
     {
-        // Create the PowerShell script in ProgramData (SYSTEM-accessible)
-        var scriptPath = Path.Combine(ProgramDataDir, "dldsr-apply.ps1");
+        if (!VulkanLayerService.IsRunningAsAdmin())
+        {
+            CrashReporter.Log("[DldsrService.ExecuteAsSystemAsync] RHI is not elevated; a SYSTEM task can't be created");
+            return false;
+        }
 
-        var scriptContent = GetApplyScript();
-        Directory.CreateDirectory(Path.GetDirectoryName(scriptPath)!);
-        await File.WriteAllTextAsync(scriptPath, scriptContent);
-        CrashReporter.Log($"[DldsrService.ExecuteAsSystemAsync] Wrote apply script to {scriptPath}");
+        var workDir = CreatePrivateWorkDir();
+        if (workDir == null) return false;
 
+        var scriptPath = Path.Combine(workDir, ScriptFileName);
         var taskName = "RHI-DLDSR-Apply";
 
         try
         {
+            await File.WriteAllTextAsync(Path.Combine(workDir, StateFileName), stateJson);
+            await File.WriteAllTextAsync(scriptPath, GetApplyScript());
+            CrashReporter.Log($"[DldsrService.ExecuteAsSystemAsync] Wrote apply script to {scriptPath}");
+            SaveLastState(stateJson);
+
             // Delete any existing task
             await RunProcessAsync("schtasks", $"/Delete /TN \"{taskName}\" /F", ignoreExitCode: true);
 
             // Create the scheduled task to run as SYSTEM
             var createArgs = $"/Create /TN \"{taskName}\" " +
-                           $"/TR \"powershell.exe -ExecutionPolicy Bypass -NoProfile -File \\\"{scriptPath}\\\" -StateFile \\\"{stateFile}\\\"\" " +
+                           $"/TR \"powershell.exe -ExecutionPolicy Bypass -NoProfile -File \\\"{scriptPath}\\\"\" " +
                            "/SC ONCE /ST 00:00 /RU SYSTEM /RL HIGHEST /F";
 
             var (createExitCode, createOutput) = await RunProcessAsync("schtasks", createArgs);
@@ -468,26 +481,104 @@ public class DldsrService : IDldsrService
 
             return true;
         }
+        catch (Exception ex)
+        {
+            CrashReporter.Log($"[DldsrService.ExecuteAsSystemAsync] Error: {ex.Message}");
+            return false;
+        }
         finally
         {
-            // Cleanup: delete the scheduled task
+            // Cleanup: delete the scheduled task, keep the script's log, remove the work folder
             await RunProcessAsync("schtasks", $"/Delete /TN \"{taskName}\" /F", ignoreExitCode: true);
+            try
+            {
+                var logPath = Path.Combine(workDir, LogFileName);
+                if (File.Exists(logPath))
+                    CrashReporter.Log($"[DldsrService.ExecuteAsSystemAsync] Task log:\n{File.ReadAllText(logPath).TrimEnd()}");
+                Directory.Delete(workDir, recursive: true);
+            }
+            catch (Exception ex)
+            {
+                CrashReporter.Log($"[DldsrService.ExecuteAsSystemAsync] Failed to clean up '{workDir}' — {ex.Message}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Creates a new folder under ProgramData that only SYSTEM and Administrators can access.
+    /// A shared folder such as C:\ProgramData\RHI inherits ProgramData's "Users can create
+    /// files" ACL, so a standard user (or malware running as the user) could pre-create it or
+    /// the script and swap the script before the SYSTEM task runs it. Standard users can't
+    /// delete or rename folders directly under ProgramData, so this folder can't be replaced.
+    /// Returns null if the folder can't be created with that ACL.
+    /// </summary>
+    private static string? CreatePrivateWorkDir()
+    {
+        var path = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+            WorkDirPrefix + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var system = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
+            var admins = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+            var security = new DirectorySecurity();
+            security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+            foreach (var sid in new[] { system, admins })
+            {
+                security.AddAccessRule(new FileSystemAccessRule(sid, FileSystemRights.FullControl,
+                    InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
+                    PropagationFlags.None, AccessControlType.Allow));
+            }
+
+            var dir = new DirectoryInfo(path);
+            if (dir.Exists)
+                throw new IOException("Folder already exists");
+            dir.Create(security);
+
+            // Create leaves an existing folder unchanged, so confirm the ACL is ours.
+            var rules = dir.GetAccessControl()
+                .GetAccessRules(includeExplicit: true, includeInherited: true, typeof(SecurityIdentifier));
+            foreach (FileSystemAccessRule rule in rules)
+            {
+                if (rule.AccessControlType == AccessControlType.Allow
+                    && !rule.IdentityReference.Equals(system)
+                    && !rule.IdentityReference.Equals(admins))
+                    throw new UnauthorizedAccessException($"Unexpected access rule for {rule.IdentityReference}");
+            }
+
+            return path;
+        }
+        catch (Exception ex)
+        {
+            CrashReporter.Log($"[DldsrService.CreatePrivateWorkDir] Failed to create '{path}' — {ex.Message}");
+            return null;
+        }
+    }
+
+    private void SaveLastState(string stateJson)
+    {
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(LastStateFilePath)!);
+            File.WriteAllText(LastStateFilePath, stateJson);
+        }
+        catch (Exception ex)
+        {
+            CrashReporter.Log($"[DldsrService.SaveLastState] Failed — {ex.Message}");
         }
     }
 
     private string GetApplyScript()
     {
-        // This script runs as SYSTEM and writes the registry values
-        // Uses ProgramData instead of LOCALAPPDATA since SYSTEM can't access user folders
+        // This script runs as SYSTEM and writes the registry values.
+        // It reads its state and writes its log next to itself, in the private work folder.
         return @"
-param([Parameter(Mandatory)][string]$StateFile)
 $ErrorActionPreference = 'Stop'
 
-$logFile = 'C:\ProgramData\RHI\dldsr-apply.log'
-function Log($msg) { 
-    $dir = Split-Path $logFile -Parent
-    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-    ""$(Get-Date -Format 'HH:mm:ss.fff') $msg"" | Out-File $logFile -Append -Encoding UTF8 
+$StateFile = Join-Path $PSScriptRoot 'dldsr-state.json'
+$logFile = Join-Path $PSScriptRoot 'dldsr-apply.log'
+function Log($msg) {
+    ""$(Get-Date -Format 'HH:mm:ss.fff') $msg"" | Out-File -LiteralPath $logFile -Append -Encoding UTF8
 }
 
 try {
@@ -508,8 +599,13 @@ try {
     }
 
     foreach ($mon in $capture.monitors) {
+        # Only accept a plain subkey name, so a capture can't point outside DisplayDatabase
+        if ($mon.monitorId -notmatch '^[^\\/*?\[\]]+$' -or $mon.monitorId -match '^\.+$') {
+            Log ""Skipping invalid monitor id: $($mon.monitorId)""
+            continue
+        }
         $path = Join-Path $db $mon.monitorId
-        if (-not (Test-Path $path)) {
+        if (-not (Test-Path -LiteralPath $path)) {
             Log ""Monitor path not found, skipping: $path""
             continue
         }
@@ -524,10 +620,10 @@ try {
                 # Try to set as string/dword
                 try {
                     if ($hexVal -match '^\d+$') {
-                        Set-ItemProperty -Path $path -Name $name -Value ([int]$hexVal) -ErrorAction SilentlyContinue
+                        Set-ItemProperty -LiteralPath $path -Name $name -Value ([int]$hexVal) -ErrorAction SilentlyContinue
                         Log ""Set $name = $hexVal (dword)""
                     } else {
-                        Set-ItemProperty -Path $path -Name $name -Value $hexVal -ErrorAction SilentlyContinue
+                        Set-ItemProperty -LiteralPath $path -Name $name -Value $hexVal -ErrorAction SilentlyContinue
                         Log ""Set $name = $hexVal (string)""
                     }
                 } catch {
@@ -775,13 +871,12 @@ try {
             // After a GPU restart, the driver may reset DisplayDatabase to defaults before
             // the next read, which would zero out the DLDSR factor bits. The capture file
             // always contains the correct blob with factors intact.
-            var lastStateFile = Path.Combine(ProgramDataDir, "dldsr-state.json");
             DldsrCapture? existingCapture = null;
             try
             {
-                if (File.Exists(lastStateFile))
+                if (File.Exists(LastStateFilePath))
                 {
-                    var json = await File.ReadAllTextAsync(lastStateFile);
+                    var json = await File.ReadAllTextAsync(LastStateFilePath);
                     existingCapture = JsonSerializer.Deserialize<DldsrCapture>(json, _jsonOptions);
                 }
             }
@@ -870,16 +965,11 @@ try {
 
             var capture = new DldsrCapture($"_smoothness_{smoothness}", DateTime.Now, GetCurrentDriverVersion(), monitors);
 
-            // Write to ProgramData state file
-            Directory.CreateDirectory(ProgramDataDir);
-            var stateFile = Path.Combine(ProgramDataDir, "dldsr-state.json");
             var stateJson = JsonSerializer.Serialize(capture, _jsonOptions);
-            await File.WriteAllTextAsync(stateFile, stateJson);
-            CrashReporter.Log($"[DldsrService.SetSmoothnessAsync] Wrote state file to {stateFile}");
 
             // Execute registry writes via scheduled task (SYSTEM privilege)
             progress?.Report("Writing smoothness configuration...");
-            if (!await ExecuteAsSystemAsync(stateFile))
+            if (!await ExecuteAsSystemAsync(stateJson))
             {
                 CrashReporter.Log("[DldsrService.SetSmoothnessAsync] Failed to execute registry writes");
                 return false;

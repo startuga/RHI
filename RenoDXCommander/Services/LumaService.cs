@@ -702,7 +702,12 @@ public class LumaService : ILumaService
                                || entry.Name.EndsWith(".addon64", StringComparison.OrdinalIgnoreCase)
                                || entry.Name.EndsWith(".addon32", StringComparison.OrdinalIgnoreCase);
                 var baseDir = isAddonFile ? addonDeployPath : gameInstallPath;
-                var destPath = Path.Combine(baseDir, entry.FullName);
+                var destPath = FileHelper.GetSafeChildPath(baseDir, entry.FullName);
+                if (destPath == null)
+                {
+                    CrashReporter.Log($"[LumaService.InstallAsync] Skipping unsafe archive entry '{entry.FullName}'");
+                    continue;
+                }
 
                 Directory.CreateDirectory(Path.GetDirectoryName(destPath)!);
                 entry.ExtractToFile(destPath, overwrite: true);
@@ -863,7 +868,13 @@ public class LumaService : ILumaService
                 continue;
             }
 
-            var fullPath = Path.Combine(record.InstallPath, relPath);
+            // Recorded paths come from archive entry names; never delete outside the game folder.
+            var fullPath = FileHelper.GetSafeChildPath(record.InstallPath, relPath);
+            if (fullPath == null)
+            {
+                CrashReporter.Log($"[LumaService.Uninstall] Skipping unsafe recorded path '{relPath}'");
+                continue;
+            }
             try
             {
                 if (File.Exists(fullPath))
@@ -875,8 +886,8 @@ public class LumaService : ILumaService
                 else if (addonDeployPath != record.InstallPath)
                 {
                     // File not at game root — check addon deploy path
-                    var addonPath = Path.Combine(addonDeployPath, relPath);
-                    if (File.Exists(addonPath)) File.Delete(addonPath);
+                    var addonPath = FileHelper.GetSafeChildPath(addonDeployPath, relPath);
+                    if (addonPath != null && File.Exists(addonPath)) File.Delete(addonPath);
                 }
             }
             catch (Exception ex)
@@ -1357,7 +1368,12 @@ public class LumaService : ILumaService
                                || entry.Name.EndsWith(".addon64", StringComparison.OrdinalIgnoreCase)
                                || entry.Name.EndsWith(".addon32", StringComparison.OrdinalIgnoreCase);
                 var baseDir = isAddonFile ? addonDeployPath : gameInstallPath;
-                var destPath = Path.Combine(baseDir, relativePath);
+                var destPath = FileHelper.GetSafeChildPath(baseDir, relativePath);
+                if (destPath == null)
+                {
+                    CrashReporter.Log($"[LumaService.InstallFromArchiveAsync] Skipping unsafe archive entry '{entry.FullName}'");
+                    continue;
+                }
 
                 Directory.CreateDirectory(Path.GetDirectoryName(destPath)!);
                 entry.ExtractToFile(destPath, overwrite: true);
