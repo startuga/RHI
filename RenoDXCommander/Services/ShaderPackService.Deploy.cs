@@ -310,8 +310,9 @@ public partial class ShaderPackService
         foreach (var rel in knownFiles)
         {
             if (keepSet.Contains(rel)) continue;
-            var path = Path.Combine(destDir, rel);
-            if (!File.Exists(path)) continue;
+            // Recorded paths come from archive entry names; never delete outside destDir.
+            var path = FileHelper.GetSafeChildPath(destDir, rel);
+            if (path == null || !File.Exists(path)) continue;
             try { File.Delete(path); }
             catch (Exception ex) { CrashReporter.Log($"[ShaderPackService.PruneFiles] Failed for '{path}' — {ex.Message}"); }
         }
@@ -492,9 +493,10 @@ public partial class ShaderPackService
         Directory.CreateDirectory(destDir);
         foreach (var rel in relPaths)
         {
-            var src = Path.Combine(sourceDir, rel);
-            if (!File.Exists(src)) continue;
-            var dest = Path.Combine(destDir, rel);
+            // Recorded paths come from archive entry names; skip any that escape either folder.
+            var src = FileHelper.GetSafeChildPath(sourceDir, rel);
+            var dest = FileHelper.GetSafeChildPath(destDir, rel);
+            if (src == null || dest == null || !File.Exists(src)) continue;
             Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
 
             if (File.Exists(dest))

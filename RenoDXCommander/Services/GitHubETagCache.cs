@@ -51,8 +51,9 @@ public class GitHubETagCache
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
 
         // Add GitHub API token if available (raises rate limit from 60 to 5000 req/hour)
+        // Only for api.github.com; callers can pass URLs for other hosts.
         var token = DevUnlockService.GitHubApiToken;
-        if (!string.IsNullOrEmpty(token))
+        if (!string.IsNullOrEmpty(token) && GitHubAuthHandler.IsGitHubApi(request.RequestUri))
             request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {token}");
 
         if (userAgent != null)

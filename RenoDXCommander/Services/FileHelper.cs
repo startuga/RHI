@@ -47,6 +47,26 @@ public static class FileHelper
     }
 
     /// <summary>
+    /// Combines <paramref name="root"/> with an untrusted relative path (an archive entry
+    /// name, or a path recorded from one) and returns the full path only when it stays
+    /// inside <paramref name="root"/>. Returns null for rooted paths and for paths that
+    /// climb out with "..", so callers can skip the entry instead of writing or deleting
+    /// outside the folder they meant to touch.
+    /// </summary>
+    public static string? GetSafeChildPath(string root, string relative)
+    {
+        if (string.IsNullOrEmpty(root) || string.IsNullOrEmpty(relative)) return null;
+        if (Path.IsPathRooted(relative)) return null;
+
+        var fullRoot = Path.GetFullPath(root);
+        if (!Path.EndsInDirectorySeparator(fullRoot))
+            fullRoot += Path.DirectorySeparatorChar;
+
+        var fullPath = Path.GetFullPath(Path.Combine(fullRoot, relative));
+        return fullPath.StartsWith(fullRoot, StringComparison.OrdinalIgnoreCase) ? fullPath : null;
+    }
+
+    /// <summary>
     /// Atomically writes <paramref name="content"/> to <paramref name="path"/> by first
     /// writing a <c>.tmp</c> file in the same directory and then renaming it over the target.
     /// This ensures a forced kill mid-write cannot leave a corrupt (zero-length or partial)

@@ -197,13 +197,13 @@ public sealed class GitHubAuthService
     }
 
     /// <summary>
-    /// Applies the token to the shared HttpClient default headers.
-    /// Removes any existing Authorization header first.
+    /// Applies the token to the shared HttpClient. <see cref="GitHubAuthHandler"/> adds it to
+    /// api.github.com requests only; it is never set as a default header, which would send it
+    /// to every host the client talks to.
     /// </summary>
     public static void ApplyTokenToHttpClient(HttpClient http, string? token)
     {
         http.DefaultRequestHeaders.Remove("Authorization");
-        if (!string.IsNullOrEmpty(token))
-            http.DefaultRequestHeaders.TryAddWithoutValidation("Authorization", $"Bearer {token}");
+        GitHubAuthHandler.Token = token;
     }
 }

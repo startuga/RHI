@@ -49,13 +49,12 @@ public partial class App : Application
                 InitialHttp2StreamWindowSize = 1024 * 1024, // 1 MB
             };
 
-            var client = new HttpClient(handler);
-            client.DefaultRequestHeaders.Add("User-Agent", "RHI/2.0");
             // GitHub API token — raises rate limit from 60 to 5000 req/hour for all services.
-            // Set as a default header so every service inherits it without per-request wiring.
-            var ghToken = DevUnlockService.GitHubApiToken;
-            if (!string.IsNullOrEmpty(ghToken))
-                client.DefaultRequestHeaders.Add("Authorization", $"Bearer {ghToken}");
+            // GitHubAuthHandler adds it to api.github.com requests only, never to the other
+            // hosts this client downloads from.
+            GitHubAuthHandler.Token = DevUnlockService.GitHubApiToken;
+            var client = new HttpClient(new GitHubAuthHandler(handler));
+            client.DefaultRequestHeaders.Add("User-Agent", "RHI/2.0");
             // Per-request timeout — generous enough for large files on slow connections.
             // Individual services can set per-request timeouts via CancellationTokenSource
             // if they need tighter control.
@@ -230,6 +229,10 @@ public partial class App : Application
             Environment.Exit(0);
             return;
         }
+
+        // Admin Mode's scheduled task starts RHI at Below Normal, which the games it
+        // launches would inherit.
+        GamePriorityService.EnsureNormalPriorityForSelf();
 
         // Only the owning instance may migrate shared application data.
         MigrateLegacyAppData();

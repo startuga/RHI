@@ -80,9 +80,17 @@ public static class SingleInstanceService
         {
             try
             {
+                // Only this user's own processes may send paths. The user SID still matches when
+                // RHI runs elevated (Admin Mode) and the second instance does not. Remote
+                // connections over SMB carry the NETWORK SID and are refused outright.
+                using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
                 var pipeSecurity = new System.IO.Pipes.PipeSecurity();
                 pipeSecurity.AddAccessRule(new System.IO.Pipes.PipeAccessRule(
-                    new System.Security.Principal.SecurityIdentifier(System.Security.Principal.WellKnownSidType.WorldSid, null),
+                    new System.Security.Principal.SecurityIdentifier(System.Security.Principal.WellKnownSidType.NetworkSid, null),
+                    System.IO.Pipes.PipeAccessRights.FullControl,
+                    System.Security.AccessControl.AccessControlType.Deny));
+                pipeSecurity.AddAccessRule(new System.IO.Pipes.PipeAccessRule(
+                    identity.User!,
                     System.IO.Pipes.PipeAccessRights.ReadWrite,
                     System.Security.AccessControl.AccessControlType.Allow));
 

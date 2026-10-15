@@ -273,9 +273,16 @@ public partial class ShaderPackService
                 var fileName = Path.GetFileName(relInRoot);
                 if (rootDir == ShadersDir && ExcludedShaderFiles.Contains(fileName)) continue;
 
-                // Place each pack's files into a subdirectory named after the pack ID
-                var relPath = Path.Combine(pack.Id, relInRoot.Replace('/', Path.DirectorySeparatorChar));
-                var destPath = Path.Combine(rootDir, relPath);
+                // Place each pack's files into a subdirectory named after the pack ID.
+                // Entry names come from a third-party archive: refuse any that would land
+                // outside the pack's folder ("..", rooted paths).
+                var destPath = FileHelper.GetSafeChildPath(
+                    Path.Combine(rootDir, pack.Id), relInRoot.Replace('/', Path.DirectorySeparatorChar));
+                if (destPath == null)
+                {
+                    CrashReporter.Log($"[ShaderPackService.EnsurePackAsync] [{pack.Id}] Skipping unsafe archive entry '{key}'");
+                    continue;
+                }
                 Directory.CreateDirectory(Path.GetDirectoryName(destPath)!);
 
                 using var entryStream = entry.OpenEntryStream();
@@ -441,6 +448,9 @@ public partial class ShaderPackService
                 // Skip excluded shaders so they are never recorded or deployed
                 var recFileName = Path.GetFileName(relInRoot);
                 if (rootDir == ShadersDir && ExcludedShaderFiles.Contains(recFileName)) continue;
+                // Never record entries that extraction refused (they would be deployed or pruned later)
+                if (FileHelper.GetSafeChildPath(Path.Combine(rootDir, packId),
+                        relInRoot.Replace('/', Path.DirectorySeparatorChar)) == null) continue;
                 // Store as relative path from RsStagingDir, with pack subdirectory
                 var subDir = rootDir == ShadersDir ? "Shaders" : "Textures";
                 files.Add(Path.Combine(subDir, packId, relInRoot.Replace('/', Path.DirectorySeparatorChar)));
